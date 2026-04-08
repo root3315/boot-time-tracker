@@ -1,0 +1,2 @@
+# No external dependencies required — uses Python standard library only.
+# sqlite3, json, subprocess, platform, statistics, datetime, pathlib are all stdlib.
