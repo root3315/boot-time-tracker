@@ -7,14 +7,20 @@ import json
 import sqlite3
 import platform
 import subprocess
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from statistics import mean, median, stdev
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 
 DATA_DIR = Path.home() / ".local" / "share" / "boot-time-tracker"
 DB_FILE = DATA_DIR / "boot_times.db"
 CONFIG_FILE = DATA_DIR / "config.json"
+ALERT_LOG_FILE = DATA_DIR / "alert_log.json"
+
+logger = logging.getLogger("boot_time_tracker")
 
 
 def ensure_data_dir():
@@ -26,6 +32,16 @@ def get_default_config():
         "boot_time_threshold_seconds": 120,
         "alert_on_slow_boot": True,
         "retention_days": 365,
+        "alert_methods": ["log"],
+        "alert_email_smtp_host": "localhost",
+        "alert_email_smtp_port": 25,
+        "alert_email_from": "",
+        "alert_email_to": "",
+        "alert_email_use_tls": False,
+        "alert_email_username": "",
+        "alert_email_password": "",
+        "alert_cooldown_seconds": 0,
+        "alert_command": "",
     }
 
 
@@ -113,7 +129,6 @@ def get_boot_time_linux():
 
     uptime_seconds = get_uptime_seconds_linux()
     if uptime_seconds is not None:
-        from datetime import timedelta
         return datetime.now(timezone.utc) - timedelta(seconds=uptime_seconds)
 
     return None
@@ -137,8 +152,7 @@ def get_boot_time_macos():
         import re
         match = re.search(r"sec = (\d+)", output)
         if match:
-            from datetime import timezone as tz
-            return datetime.fromtimestamp(int(match.group(1)), tz=tz.utc)
+            return datetime.fromtimestamp(int(match.group(1)), tz=timezone.utc)
     return None
 
 
@@ -251,7 +265,6 @@ def record_boot(conn, boot_time, phases, config):
 
 
 def cleanup_old_records(conn, retention_days):
-    from datetime import timedelta
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM boot_phases WHERE boot_record_id IN "
@@ -259,6 +272,169 @@ def cleanup_old_records(conn, retention_days):
     cursor.execute("DELETE FROM boot_records WHERE boot_time < ?", (cutoff,))
     conn.commit()
     return cursor.rowcount
+
+
+def load_alert_history():
+    if ALERT_LOG_FILE.exists():
+        with open(ALERT_LOG_FILE, "r") as f:
+            return json.load(f)
+    return {"alerts": []}
+
+
+def save_alert_history(history):
+    with open(ALERT_LOG_FILE, "w") as f:
+        json.dump(history, f, indent=2)
+
+
+def is_alert_cooldown_active(config):
+    cooldown = config.get("alert_cooldown_seconds", 0)
+    if cooldown <= 0:
+        return False
+    history = load_alert_history()
+    if not history["alerts"]:
+        return False
+    last_alert_time = history["alerts"][-1].get("timestamp", "")
+    try:
+        last_dt = datetime.fromisoformat(last_alert_time)
+        now = datetime.now(timezone.utc)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        elapsed = (now - last_dt).total_seconds()
+        return elapsed < cooldown
+    except (ValueError, TypeError):
+        return False
+
+
+def record_alert(boot_record_id, duration, threshold, method, details=""):
+    history = load_alert_history()
+    history["alerts"].append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "boot_record_id": boot_record_id,
+        "duration_seconds": duration,
+        "threshold_seconds": threshold,
+        "method": method,
+        "details": details,
+    })
+    max_entries = 1000
+    if len(history["alerts"]) > max_entries:
+        history["alerts"] = history["alerts"][-max_entries:]
+    save_alert_history(history)
+
+
+def send_alert_log(boot_record_id, duration, threshold, hostname):
+    message = (
+        f"SLOW BOOT DETECTED\n"
+        f"  Hostname:  {hostname}\n"
+        f"  Boot time: {duration:.1f}s\n"
+        f"  Threshold: {threshold:.1f}s\n"
+        f"  Over by:   {duration - threshold:.1f}s\n"
+        f"  Recorded:  {datetime.now(timezone.utc).isoformat()}\n"
+    )
+    print(message)
+    record_alert(boot_record_id, duration, threshold, "log", message.strip())
+    return True
+
+
+def send_alert_email(boot_record_id, duration, threshold, hostname, config):
+    smtp_host = config.get("alert_email_smtp_host", "localhost")
+    smtp_port = config.get("alert_email_smtp_port", 25)
+    from_addr = config.get("alert_email_from", "")
+    to_addr = config.get("alert_email_to", "")
+    use_tls = config.get("alert_email_use_tls", False)
+    username = config.get("alert_email_username", "")
+    password = config.get("alert_email_password", "")
+
+    if not from_addr or not to_addr:
+        logger.warning("Email alerting configured but from/to addresses are empty.")
+        return False
+
+    subject = f"[boot-time-tracker] Slow boot on {hostname}: {duration:.1f}s"
+    body = (
+        f"Slow boot detected on {hostname}\n"
+        f"\n"
+        f"  Boot duration: {duration:.1f}s\n"
+        f"  Threshold:     {threshold:.1f}s\n"
+        f"  Over by:       {duration - threshold:.1f}s\n"
+        f"  Time:          {datetime.now(timezone.utc).isoformat()}\n"
+    )
+
+    msg = MIMEMultipart()
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        import smtplib
+        server = smtplib.SMTP(smtp_host, smtp_port)
+        if use_tls:
+            server.starttls()
+        if username and password:
+            server.login(username, password)
+        server.sendmail(from_addr, to_addr, msg.as_string())
+        server.quit()
+        record_alert(boot_record_id, duration, threshold, "email",
+                     f"Sent to {to_addr}")
+        return True
+    except Exception as exc:
+        logger.error(f"Failed to send email alert: {exc}")
+        record_alert(boot_record_id, duration, threshold, "email",
+                     f"FAILED: {exc}")
+        return False
+
+
+def send_alert_command(boot_record_id, duration, threshold, hostname, config):
+    alert_cmd = config.get("alert_command", "")
+    if not alert_cmd:
+        return False
+
+    env = os.environ.copy()
+    env["BOOT_DURATION"] = str(duration)
+    env["BOOT_THRESHOLD"] = str(threshold)
+    env["BOOT_HOSTNAME"] = hostname
+    env["BOOT_RECORD_ID"] = str(boot_record_id)
+
+    try:
+        result = subprocess.run(
+            alert_cmd, shell=True, env=env,
+            capture_output=True, text=True, timeout=30
+        )
+        status = "ok" if result.returncode == 0 else f"exit {result.returncode}"
+        record_alert(boot_record_id, duration, threshold, "command",
+                     f"cmd='{alert_cmd}' status={status}")
+        return result.returncode == 0
+    except Exception as exc:
+        logger.error(f"Failed to run alert command: {exc}")
+        record_alert(boot_record_id, duration, threshold, "command",
+                     f"FAILED: {exc}")
+        return False
+
+
+def handle_slow_boot_alert(conn, boot_record_id, duration, config):
+    if not config.get("alert_on_slow_boot", True):
+        return
+
+    threshold = config.get("boot_time_threshold_seconds", 120)
+    if duration <= threshold:
+        return
+
+    if is_alert_cooldown_active(config):
+        logger.info("Alert suppressed by cooldown.")
+        return
+
+    hostname = platform.node()
+    methods = config.get("alert_methods", ["log"])
+    if isinstance(methods, str):
+        methods = [methods]
+
+    for method in methods:
+        method = method.strip().lower()
+        if method == "log":
+            send_alert_log(boot_record_id, duration, threshold, hostname)
+        elif method == "email":
+            send_alert_email(boot_record_id, duration, threshold, hostname, config)
+        elif method == "command":
+            send_alert_command(boot_record_id, duration, threshold, hostname, config)
 
 
 def print_stats(conn):
@@ -303,6 +479,29 @@ def print_stats(conn):
     print(f"{'='*50}\n")
 
 
+def print_alerts(conn):
+    history = load_alert_history()
+    alerts = history.get("alerts", [])
+    if not alerts:
+        print("No slow boot alerts recorded.")
+        return
+
+    print(f"\n{'='*50}")
+    print(f"Slow Boot Alerts ({len(alerts)} total)")
+    print(f"{'='*50}")
+    for alert in alerts[-20:]:
+        ts = alert.get("timestamp", "unknown")
+        dur = alert.get("duration_seconds", 0)
+        thresh = alert.get("threshold_seconds", 0)
+        method = alert.get("method", "?")
+        details = alert.get("details", "")
+        print(f"  [{ts}] {dur:.1f}s (threshold {thresh:.1f}s) via {method}")
+        if details and details != "N/A":
+            short = details[:80]
+            print(f"    {short}")
+    print(f"{'='*50}\n")
+
+
 def main():
     ensure_data_dir()
     config = load_config()
@@ -330,22 +529,35 @@ def main():
         if removed > 0:
             print(f"Cleaned up {removed} old records.")
 
+        duration = phases.get("total")
+        if duration is not None:
+            handle_slow_boot_alert(conn, record_id, duration, config)
+
         print_stats(conn)
 
     elif sys.argv[1] == "stats":
         print_stats(conn)
 
+    elif sys.argv[1] == "alerts":
+        print_alerts(conn)
+
     elif sys.argv[1] == "config":
-        if len(sys.argv) == 4 and sys.argv[2] == "set":
+        if len(sys.argv) >= 4 and sys.argv[2] == "set":
             key = sys.argv[3]
             value = sys.argv[4] if len(sys.argv) > 4 else None
             if value is None:
                 print("Usage: boot_time_tracker.py config set <key> <value>")
                 sys.exit(1)
             try:
-                config[key] = float(value)
+                if "." in value:
+                    config[key] = float(value)
+                else:
+                    config[key] = int(value)
             except ValueError:
-                config[key] = value
+                if value.lower() in ("true", "false"):
+                    config[key] = value.lower() == "true"
+                else:
+                    config[key] = value
             save_config(config)
             print(f"Config updated: {key} = {config[key]}")
         else:
@@ -360,8 +572,12 @@ def main():
         conn.commit()
         print("All boot records cleared.")
 
+    elif sys.argv[1] == "clear-alerts":
+        save_alert_history({"alerts": []})
+        print("All alert history cleared.")
+
     else:
-        print("Usage: boot_time_tracker.py [stats|config|clear]")
+        print("Usage: boot_time_tracker.py [stats|alerts|config|clear|clear-alerts]")
         sys.exit(1)
 
     conn.close()
